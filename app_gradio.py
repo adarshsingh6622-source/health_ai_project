@@ -3,19 +3,23 @@ import pandas as pd
 import joblib
 import os
 import requests
-from pathlib import Path
+import numpy as np
 
-# ---------------- API KEY ----------------
+from pathlib import Path
+from tensorflow.keras.models import load_model
+
+# ================= API =================
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# ---------------- PATH ----------------
+# ================= PATH =================
 BASE_DIR = Path(__file__).resolve().parent
 
-# ---------------- LOAD MODEL ----------------
-model = joblib.load(BASE_DIR / "model/health_model.pkl")
-vectorizer = joblib.load(BASE_DIR / "model/vectorizer.pkl")
+# ================= LOAD MODEL =================
+model = load_model(BASE_DIR / "model/health_model_dl.h5")
+vectorizer = joblib.load(BASE_DIR / "model/vectorizer_dl.pkl")
+le = joblib.load(BASE_DIR / "model/label_encoder.pkl")
 
-# ---------------- LOAD DATA ----------------
+# ================= LOAD DATA =================
 df = pd.read_csv(BASE_DIR / "data/Original_Dataset.csv")
 df.columns = df.columns.str.strip()
 
@@ -25,7 +29,7 @@ desc_df.columns = desc_df.columns.str.strip()
 doc_df = pd.read_csv(BASE_DIR / "data/Doctor_Versus_Disease.csv")
 doc_df.columns = doc_df.columns.str.strip()
 
-# ---------------- EXTRACT SYMPTOMS ----------------
+# ================= SYMPTOMS =================
 symptom_cols = [col for col in df.columns if col != "Disease"]
 
 all_symptoms = set()
@@ -34,20 +38,25 @@ for col in symptom_cols:
 
 all_symptoms = sorted([str(s).strip() for s in all_symptoms if str(s).strip() != ""])
 
-# ---------------- FUNCTIONS ----------------
+# ================= FUNCTIONS =================
+
 def get_description(disease):
-    disease = disease.strip()
-    row = desc_df[desc_df.iloc[:, 0].str.strip() == disease]
-    if not row.empty:
-        return row.iloc[0][1]
-    return "No description available"
+    try:
+        disease = disease.strip().lower()
+        desc_df["Disease"] = desc_df["Disease"].astype(str).str.strip().str.lower()
+        row = desc_df[desc_df["Disease"] == disease]
+        return row.iloc[0, 1] if not row.empty else "No description available"
+    except:
+        return "No description available"
 
 def get_doctor(disease):
-    disease = disease.strip()
-    row = doc_df[doc_df.iloc[:, 0].str.strip() == disease]
-    if not row.empty:
-        return row.iloc[0][1]
-    return "Consult general physician"
+    try:
+        disease = disease.strip().lower()
+        doc_df.iloc[:, 0] = doc_df.iloc[:, 0].astype(str).str.strip().str.lower()
+        row = doc_df[doc_df.iloc[:, 0] == disease]
+        return row.iloc[0, 1] if not row.empty else "Consult general physician"
+    except:
+        return "Consult general physician"
 
 def ask_groq(prompt):
     if not GROQ_API_KEY:
@@ -66,55 +75,60 @@ def ask_groq(prompt):
     }
 
     try:
-        res = requests.post(url, headers=headers, json=data)
+        res = requests.post(url, headers=headers, json=data, timeout=10)
         result = res.json()
+        return result["choices"][0]["message"]["content"]
+    except:
+        return "AI service temporarily unavailable"
 
-        if "choices" in result:
-            return result["choices"][0]["message"]["content"]
+# ================= MAIN FUNCTION =================
+
+def predict(symptoms):
+    try:
+        if not symptoms:
+            return "Select symptoms", "", "", "", ""
+
+        # ===== SMART MATCHING =====
+        matches = []
+
+        for i, row in df.iterrows():
+            row_symptoms = row.drop("Disease").values
+            row_symptoms = [str(s).strip() for s in row_symptoms if str(s) != "nan"]
+
+            score = len(set(symptoms) & set(row_symptoms))
+
+            if score > 0:
+                matches.append((row["Disease"], score))
+
+        if matches:
+            matches = sorted(matches, key=lambda x: x[1], reverse=True)
+            pred = matches[0][0]
         else:
-            return str(result)
+            # ===== DL fallback =====
+            input_text = " ".join(symptoms)
+            input_vec = vectorizer.transform([input_text]).toarray()
+
+            probs = model.predict(input_vec)
+            pred_index = np.argmax(probs)
+            pred = le.inverse_transform([pred_index])[0]
+
+        # ===== EXTRA INFO =====
+        description = get_description(pred)
+        doctor = get_doctor(pred)
+
+        # ===== AI =====
+        explanation = ask_groq(f"Disease: {pred}. Explain simply.")
+        advice = ask_groq(f"Disease: {pred}. Give home remedies, diet and when to see doctor.")
+
+        return pred, description, doctor, explanation, advice
 
     except Exception as e:
-        return str(e)
+        return "Error", str(e), "", "", ""
 
-# ---------------- MAIN FUNCTION ----------------
-def predict(symptoms):
-    if not symptoms:
-        return "Please select symptoms", "", "", "", ""
+# ================= UI =================
 
-    input_text = " ".join(symptoms)
-    input_vec = vectorizer.transform([input_text])
-
-    pred = model.predict(input_vec)[0]
-
-    description = get_description(pred)
-    doctor = get_doctor(pred)
-
-    # AI Explanation
-    prompt1 = f"""
-    Disease: {pred}
-    Explain:
-    - What is it
-    - Causes
-    - Is it serious
-    """
-    explanation = ask_groq(prompt1)
-
-    # AI Advice
-    prompt2 = f"""
-    Disease: {pred}
-    Give advice:
-    - Home remedies
-    - Diet
-    - When to see doctor
-    """
-    advice = ask_groq(prompt2)
-
-    return pred, description, doctor, explanation, advice
-
-# ---------------- GRADIO UI ----------------
 with gr.Blocks() as demo:
-    gr.Markdown("# 🏥 AI Health Analyzer")
+    gr.Markdown("# 🧠 AI Health Analyzer ")
 
     symptoms_input = gr.Dropdown(all_symptoms, multiselect=True, label="Select Symptoms")
 
